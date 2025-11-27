@@ -66,15 +66,15 @@ async def _fetch_alpaca_positions(
     Fetch open positions from Alpaca PAPER account.
 
     Uses:
-      - APCA_API_KEY_ID
-      - APCA_API_SECRET_KEY
-      - ALPACA_PAPER_BASE_URL (optional, defaults to paper-api.alpaca.markets/v2)
+      - ALPACA_API_KEY
+      - ALPACA_API_SECRET
+      - ALPACA_PAPER_BASE_URL (optional, defaults to https://paper-api.alpaca.markets/v2)
     """
-    api_key = os.environ.get("APCA_API_KEY_ID")
-    api_secret = os.environ.get("APCA_API_SECRET_KEY")
+    api_key = os.environ.get("ALPACA_API_KEY")
+    api_secret = os.environ.get("ALPACA_API_SECRET")
     if not api_key or not api_secret:
         raise RuntimeError(
-            "Missing APCA_API_KEY_ID / APCA_API_SECRET_KEY environment variables"
+            "Missing ALPACA_API_KEY / ALPACA_API_SECRET environment variables"
         )
 
     base_url = os.environ.get(
@@ -87,18 +87,27 @@ async def _fetch_alpaca_positions(
         "APCA-API-SECRET-KEY": api_secret,
     }
 
+    log("debug", "alpaca_positions_request", url=url)
+
     resp = await client.get(url, headers=headers, timeout=10.0)
     resp.raise_for_status()
     data = resp.json()
 
     # Alpaca returns a list; just be defensive
     if isinstance(data, list):
+        log("debug", "alpaca_positions_response_list", count=len(data))
         return data
     if isinstance(data, dict) and "positions" in data and isinstance(
         data["positions"], list
     ):
+        log("debug", "alpaca_positions_response_dict", count=len(data["positions"]))
         return data["positions"]
 
+    log(
+        "warning",
+        "alpaca_positions_unexpected_response_shape",
+        shape=type(data).__name__,
+    )
     return []
 
 
@@ -108,10 +117,19 @@ async def run_positions_loop() -> None:
 
     Flow:
       1) Fetch open positions from Alpaca PAPER.
-      2) Normalize into (symbol / occ / asset_type / qty / avg_cost / underlier_symbol).
-      3) Call Tradier LIVE for quotes (mark / prev_close / underlier_spot).
-      4) Upsert into public.positions via Supabase.
-      5) Delete any DB positions that disappeared from the broker.
+      2) Normalize them into a unified format:
+         - symbol
+         - occ (for options)
+         - asset_type (equity / option)
+         - qty
+         - avg_cost
+         - underlier_symbol
+         - contract_multiplier
+      3) Fetch LIVE quotes from Tradier for both:
+         - equity symbols (for mark / prev_close)
+         - OCC symbols and underliers (for options and their spot).
+      4) Upsert each into Supabase public.positions
+      5) Delete positions that no longer exist at the broker
     """
     interval = max(3, settings.poll_positions_sec)
     log(
@@ -136,14 +154,14 @@ async def run_positions_loop() -> None:
                     count=len(raw_positions),
                 )
 
-                # If nothing, skip
+                # If nothing, skip this cycle
                 if not raw_positions:
+                    log("info", "alpaca_positions_empty", reason="no_open_positions")
                     await asyncio.sleep(interval)
                     continue
 
-                # 2) Build symbol list for quotes (live via Tradier)
+                # 2) Normalize positions and build symbol list for LIVE quotes
                 symbols_to_quote: List[str] = []
-                # We'll also precompute some metadata for each position
                 enriched: List[Dict[str, Any]] = []
 
                 # Fallback account_id if Alpaca doesn’t send one
@@ -156,6 +174,7 @@ async def run_positions_loop() -> None:
 
                     sym_raw = str(p.get("symbol", "")).upper().strip()
                     if not sym_raw:
+                        log("warning", "alpaca_position_missing_symbol", raw=p)
                         continue
 
                     # Alpaca sends qty as string
@@ -163,6 +182,7 @@ async def run_positions_loop() -> None:
                     try:
                         qty = int(float(qty_raw))
                     except Exception:
+                        log("warning", "alpaca_position_bad_qty", qty_raw=qty_raw, raw=p)
                         qty = 0
 
                     # Use Alpaca cost_basis / avg_entry_price if available
@@ -183,7 +203,10 @@ async def run_positions_loop() -> None:
                     if is_option:
                         # OCC string from Alpaca (e.g. SPY251126P00672000)
                         occ = sym_raw
+
+                        # Underlier extracted from OCC (SPY251126P00672000 → SPY)
                         underlier_symbol = extract_underlier(sym_raw)
+
                         # The “symbol” we store in DB is always the simple underlier
                         symbol = underlier_symbol
                     else:
@@ -192,9 +215,9 @@ async def run_positions_loop() -> None:
                         underlier_symbol = ""
                         symbol = sym_raw
 
-                    # Collect for quotes:
+                    # Collect for quotes (LIVE via Tradier):
                     if asset_type == "equity":
-                        # Equities: quote the symbol itself (via Tradier live)
+                        # Equities: quote the symbol itself
                         symbols_to_quote.append(symbol)
                     else:
                         # Options: quote the OCC for option price,
@@ -217,10 +240,27 @@ async def run_positions_loop() -> None:
                         }
                     )
 
+                log(
+                    "debug",
+                    "positions_normalized",
+                    count=len(enriched),
+                    symbols_to_quote_count=len(symbols_to_quote),
+                )
+
                 # 3) Fetch LIVE quotes for all collected symbols (Tradier LIVE)
                 async with httpx.AsyncClient() as live_client:
+                    log(
+                        "info",
+                        "quotes_request_start",
+                        symbols_count=len(symbols_to_quote),
+                    )
                     quotes = await tradier_client.fetch_quotes(
                         live_client, symbols_to_quote
+                    )
+                    log(
+                        "info",
+                        "quotes_response_received",
+                        quotes_keys=len(quotes.keys()) if isinstance(quotes, dict) else 0,
                     )
 
                 # 4) Build fully-populated rows and upsert into positions
@@ -241,29 +281,31 @@ async def run_positions_loop() -> None:
                     underlier_spot = None
 
                     if asset_type == "option":
-                        # Option mark from OCC symbol (fallback to symbol)
+                        # Option mark from OCC symbol (fallback to underlier if needed)
                         oq_key = occ or symbol
-                        oq = quotes.get(oq_key)
+                        oq = quotes.get(oq_key) if isinstance(quotes, dict) else None
                         if oq:
                             mark = oq.get("last") or oq.get("close")
                             prev_close = oq.get("prevclose")
 
                         # Underlier spot from underlying symbol, if we have it
                         if underlier_symbol:
-                            uq = quotes.get(underlier_symbol)
+                            uq = (
+                                quotes.get(underlier_symbol)
+                                if isinstance(quotes, dict)
+                                else None
+                            )
                             if uq:
                                 underlier_spot = uq.get("last") or uq.get("close")
                     else:
                         # Equity: mark and spot from same symbol
-                        sq = quotes.get(symbol)
+                        sq = quotes.get(symbol) if isinstance(quotes, dict) else None
                         if sq:
                             mark = sq.get("last") or sq.get("close")
                             prev_close = sq.get("prevclose")
                             underlier_spot = mark
 
                     # Build primary key id
-                    # NOTE: still using Supabase helper that has "tradier" in the name
-                    #       to avoid touching DB/schema right now.
                     pid_symbol = occ if (asset_type == "option" and occ) else symbol
                     pid = supabase_client.build_tradier_id(account_id, pid_symbol)
 
@@ -281,6 +323,15 @@ async def run_positions_loop() -> None:
                         "last_updated": _now_iso(),
                     }
 
+                    log(
+                        "debug",
+                        "position_row_built",
+                        id=pid,
+                        symbol=symbol,
+                        asset_type=asset_type,
+                        qty=qty,
+                    )
+
                     current_ids.append(pid)
                     status = supabase_client.upsert_position_row(row)
                     log(
@@ -294,14 +345,19 @@ async def run_positions_loop() -> None:
                     )
 
                 # 5) Delete positions that no longer exist at the broker
-                #    (function name still has "tradier", but logic is generic).
                 supabase_client.delete_missing_tradier_positions(current_ids)
+                log(
+                    "info",
+                    "positions_cleanup_done",
+                    kept_count=len(current_ids),
+                )
 
         except Exception as e:
             log("error", "positions_loop_error", error=str(e))
 
         elapsed = (datetime.now(timezone.utc) - start).total_seconds()
         sleep_for = max(0, interval - elapsed)
+        log("debug", "positions_loop_sleep", sleep_for=sleep_for)
         await asyncio.sleep(sleep_for)
 
 
@@ -321,12 +377,13 @@ async def run_quotes_loop() -> None:
     while True:
         start = datetime.now(timezone.utc)
         try:
-            # Still using the existing Supabase helper; it doesn't care
-            # whether positions came from Tradier or Alpaca.
             active = supabase_client.fetch_active_tradier_positions()
             if not active:
+                log("info", "quotes_loop_no_active_positions")
                 await asyncio.sleep(interval)
                 continue
+
+            log("debug", "quotes_loop_active_positions", count=len(active))
 
             symbols_to_quote: List[str] = []
             for r in active:
@@ -336,18 +393,27 @@ async def run_quotes_loop() -> None:
                 asset_type = r.get("asset_type")
 
                 if asset_type == "option":
-                    # For options, quote OCC for option price and underlier for spot
                     if occ:
                         symbols_to_quote.append(occ)
                     if underlier:
                         symbols_to_quote.append(underlier)
                 else:
-                    # For equities, just quote the symbol
                     if symbol:
                         symbols_to_quote.append(symbol)
 
+            log(
+                "debug",
+                "quotes_loop_symbols_to_quote",
+                symbols_count=len(symbols_to_quote),
+            )
+
             async with httpx.AsyncClient() as client:
                 quotes = await tradier_client.fetch_quotes(client, symbols_to_quote)
+                log(
+                    "info",
+                    "quotes_loop_quotes_received",
+                    quotes_keys=len(quotes.keys()) if isinstance(quotes, dict) else 0,
+                )
 
             for r in active:
                 pid = r["id"]
@@ -361,20 +427,22 @@ async def run_quotes_loop() -> None:
                 underlier_spot = None
 
                 if asset_type == "option":
-                    # Option mark from OCC (fallback to symbol)
                     oq_key = occ or symbol
-                    oq = quotes.get(oq_key)
+                    oq = quotes.get(oq_key) if isinstance(quotes, dict) else None
                     if oq:
                         mark = oq.get("last") or oq.get("close")
                         prev_close = oq.get("prevclose")
 
-                    # Underlier spot from underlier
                     if underlier:
-                        uq = quotes.get(underlier)
+                        uq = (
+                            quotes.get(underlier)
+                            if isinstance(quotes, dict)
+                            else None
+                        )
                         if uq:
                             underlier_spot = uq.get("last") or uq.get("close")
                 else:
-                    sq = quotes.get(symbol)
+                    sq = quotes.get(symbol) if isinstance(quotes, dict) else None
                     if sq:
                         mark = sq.get("last") or sq.get("close")
                         prev_close = sq.get("prevclose")
@@ -386,6 +454,16 @@ async def run_quotes_loop() -> None:
                     "underlier_spot": _safe_float(underlier_spot),
                     "last_updated": _now_iso(),
                 }
+
+                log(
+                    "debug",
+                    "quotes_loop_update_fields",
+                    id=pid,
+                    mark=fields["mark"],
+                    prev_close=fields["prev_close"],
+                    underlier_spot=fields["underlier_spot"],
+                )
+
                 supabase_client.update_quote_fields(pid, fields)
 
             log("info", "quotes_updated", count=len(active), env="live")
@@ -395,12 +473,13 @@ async def run_quotes_loop() -> None:
 
         elapsed = (datetime.now(timezone.utc) - start).total_seconds()
         sleep_for = max(0, interval - elapsed)
+        log("debug", "quotes_loop_sleep", sleep_for=sleep_for)
         await asyncio.sleep(sleep_for)
 
 
 async def run_spot_indicators_loop() -> None:
     """
-    Polygon/market-data–friendly mode:
+    Polygon Basic–friendly mode:
 
     - Run every 30 seconds.
     - Each cycle:
@@ -414,6 +493,7 @@ async def run_spot_indicators_loop() -> None:
     - Result:
         - ~2 aggregate calls per minute from the bot.
         - Each timeframe refreshed about every 2 minutes.
+        - Plenty of buffer under a 5 calls/min rate limit.
     """
     # 30 seconds between cycles → ~2 calls/min
     interval = 30
@@ -430,6 +510,8 @@ async def run_spot_indicators_loop() -> None:
 
     log("info", "spot_indicators_loop_start", interval=interval)
 
+    global symbol_index_for_indicators
+
     while True:
         start = datetime.now(timezone.utc)
 
@@ -439,9 +521,6 @@ async def run_spot_indicators_loop() -> None:
 
         try:
             # Only one symbol per cycle to keep load tiny
-            global symbol_index_for_indicators
-
-            # Fetch ALL eligible symbols; we'll rotate through them
             symbols = supabase_client.fetch_spot_symbols_for_indicators()
 
             if not symbols:
@@ -470,6 +549,14 @@ async def run_spot_indicators_loop() -> None:
                             limit=1000,
                         )
 
+                        log(
+                            "debug",
+                            "spot_indicators_candles_fetched",
+                            symbol=symbol,
+                            timeframe=tf,
+                            count=len(candles),
+                        )
+
                         if len(candles) < 30:
                             log(
                                 "info",
@@ -485,6 +572,13 @@ async def run_spot_indicators_loop() -> None:
                                 use_case=use_case,
                                 fractal=2,
                             )
+                            log(
+                                "debug",
+                                "spot_indicators_snapshot_computed",
+                                symbol=symbol,
+                                timeframe=tf,
+                            )
+
                             supabase_client.upsert_spot_tf_row(symbol, snapshot)
 
                             log(
@@ -526,4 +620,6 @@ async def run_spot_indicators_loop() -> None:
             log("error", "spot_indicators_loop_error", error=str(e))
 
         elapsed = (datetime.now(timezone.utc) - start).total_seconds()
-        await asyncio.sleep(max(0, interval - elapsed))
+        sleep_for = max(0, interval - elapsed)
+        log("debug", "spot_indicators_loop_sleep", sleep_for=sleep_for)
+        await asyncio.sleep(sleep_for)
