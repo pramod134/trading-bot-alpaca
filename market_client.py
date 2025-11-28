@@ -1,7 +1,7 @@
 import httpx
 from typing import Any, Dict, List
 
-from .config import settings
+from config import settings
 
 # Live auth (quotes) - Tradier live is kept for market data only
 QUOTE_HEADERS = {
