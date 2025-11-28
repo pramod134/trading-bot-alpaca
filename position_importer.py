@@ -6,10 +6,11 @@ from typing import Any, Dict, List
 
 import httpx
 
-from .config import settings
-from .logger import log
-from . import supabase_client
-from . import market_client
+from config import settings
+from logger import log
+import supabase_client
+import market_client
+
 
 
 OCC_UNDERLYING_RE = re.compile(r"^([A-Za-z]+)")
