@@ -4,22 +4,19 @@ from dataclasses import dataclass
 
 @dataclass
 class Settings:
-    # Which broker to use for what
-    trading_broker: str          # e.g. "alpaca"
-    market_data_broker: str      # e.g. "tradier", later maybe "public"
+    # Sandbox (positions) - no longer used for trading, kept for compatibility
+    tradier_sandbox_token: str
+    tradier_sandbox_accounts: list[str]
+    tradier_sandbox_base: str
 
-    # Tradier (live quotes)
-    tradier_live_token: str | None
-    tradier_live_base: str | None
+    # Live (quotes)
+    tradier_live_token: str
+    tradier_live_base: str
 
-    # Alpaca (paper trading)
-    alpaca_key: str | None
-    alpaca_secret: str | None
-    alpaca_paper_base: str | None
-
-    # Public (future: live quotes or trading)
-    public_api_key: str | None
-    public_base_url: str | None
+    # Alpaca paper trading (positions)
+    alpaca_api_key: str
+    alpaca_api_secret: str
+    alpaca_paper_base: str
 
     # Supabase
     supabase_url: str
@@ -28,34 +25,36 @@ class Settings:
     # Timers
     poll_positions_sec: int
     poll_quotes_sec: int
+
+    # Spot TF polling (kept for compatibility, even though indicators loop is archived)
     poll_spot_tf_sec: int = int(os.getenv("POLL_SPOT_TF_SEC", "900"))  # 15 minutes default
 
     @classmethod
     def load(cls) -> "Settings":
-        # Broker selectors: change these envs later instead of changing code
-        trading_broker = os.environ.get("TRADING_BROKER", "alpaca")
-        market_data_broker = os.environ.get("MARKET_DATA_BROKER", "tradier")
-
         return cls(
-            trading_broker=trading_broker,
-            market_data_broker=market_data_broker,
+            # Sandbox (legacy - not used for trading anymore)
+            tradier_sandbox_token=os.environ.get("TRADIER_SANDBOX_TOKEN", ""),
+            tradier_sandbox_accounts=[
+                a.strip()
+                for a in os.environ.get("TRADIER_SANDBOX_ACCOUNT_IDS", "").split(",")
+                if a.strip()
+            ],
+            tradier_sandbox_base=os.environ.get(
+                "TRADIER_SANDBOX_BASE_URL", "https://sandbox.tradier.com/v1"
+            ),
 
-            # Tradier live (used now for quotes; optional if you switch later)
-            tradier_live_token=os.environ.get("TRADIER_LIVE_TOKEN"),
+            # Live (quotes)
+            tradier_live_token=os.environ["TRADIER_LIVE_TOKEN"],
             tradier_live_base=os.environ.get(
                 "TRADIER_LIVE_BASE_URL", "https://api.tradier.com/v1"
-            ) if market_data_broker == "tradier" else None,
+            ),
 
-            # Alpaca paper (current trading engine)
-            alpaca_key=os.environ.get("ALPACA_API_KEY"),
-            alpaca_secret=os.environ.get("ALPACA_API_SECRET"),
+            # Alpaca paper (positions)
+            alpaca_api_key=os.environ["ALPACA_API_KEY"],
+            alpaca_api_secret=os.environ["ALPACA_API_SECRET"],
             alpaca_paper_base=os.environ.get(
                 "ALPACA_PAPER_BASE_URL", "https://paper-api.alpaca.markets"
-            ) if trading_broker == "alpaca" else None,
-
-            # Public.com (future use)
-            public_api_key=os.environ.get("PUBLIC_API_KEY"),
-            public_base_url=os.environ.get("PUBLIC_BASE_URL"),
+            ),
 
             # Supabase
             supabase_url=os.environ["SUPABASE_URL"],
