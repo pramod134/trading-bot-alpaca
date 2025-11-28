@@ -6,9 +6,10 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 from supabase import Client, create_client
 
-from .config import settings
-from .logger import log
-from . import tradier_client
+from config import settings
+from logger import log
+import market_client
+
 
 
 # ---------- Supabase client (local to this module) ----------
@@ -130,7 +131,7 @@ async def _get_underlier_spot(
                 symbol=symbol_u,
                 attempt=attempt,
             )
-            quotes = await tradier_client.fetch_quotes(client, [symbol_u])
+            quotes = await market_client.fetch_quotes(client, [symbol_u])
             q = quotes.get(symbol_u)
             if q:
                 last = _safe_float(q.get("last"))
