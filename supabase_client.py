@@ -4,8 +4,8 @@ from typing import Any, Dict, List
 
 from supabase import Client, create_client
 
-from .config import settings
-from .logger import log
+from config import settings
+from logger import log
 
 
 # ---------- JSON sanitization helpers ----------
