@@ -13,9 +13,8 @@ from .logger import log
 def _sanitize_value(v: Any) -> Any:
     """
     Make sure a value is safe to send through Supabase's JSON client:
-
-    - NaN / +/-inf -> None
     - datetimes/dates -> ISO strings
+    - NaN / +/-inf -> None
     - dicts/lists -> sanitized recursively
     - everything else -> unchanged
     """
@@ -25,10 +24,9 @@ def _sanitize_value(v: Any) -> Any:
     if isinstance(v, float):
         if not math.isfinite(v):
             return None
-        return v
 
     if isinstance(v, dict):
-        return {k: _sanitize_value(x) for k, x in v.items()}
+        return {k: _sanitize_value(val) for k, val in v.items()}
 
     if isinstance(v, list):
         return [_sanitize_value(x) for x in v]
@@ -37,86 +35,59 @@ def _sanitize_value(v: Any) -> Any:
 
 
 def _sanitize_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Apply _sanitize_value to all values in the row.
-    """
     return {k: _sanitize_value(v) for k, v in row.items()}
 
 
-# ---------- Supabase client ----------
+# ---------- Supabase client singleton ----------
 
-log("debug", "supabase_client_init", url=settings.supabase_url)
-sb: Client = create_client(settings.supabase_url, settings.supabase_key)
+_sb: Client | None = None
 
 
-# ---------- Helpers for indicators (spot_tf) ----------
+def get_client() -> Client:
+    global _sb
+    if _sb is None:
+        _sb = create_client(settings.supabase_url, settings.supabase_key)
+    return _sb
+
+
+sb = get_client()
+
+
+# ---------- spot_tf helpers (kept for archived indicators) ----------
 
 def upsert_spot_tf_row(symbol: str, snapshot: Dict[str, Any]) -> None:
     """
-    Upsert one row into spot_tf for given symbol + timeframe + use_case.
-
-    snapshot must include:
-      - timeframe
-      - use_case (optional, defaults to 'generic')
-      - structure_state
-      - swings
-      - fvgs
-      - liquidity
-      - volume_profile
-      - trend
-      - extras
+    Upsert one row into spot_tf (symbol+timeframe+use_case unique).
     """
-    timeframe = snapshot["timeframe"]
-    use_case = snapshot.get("use_case", "generic")
+    sb = get_client()
 
-    row: Dict[str, Any] = {
+    timeframe = snapshot.get("timeframe")
+    use_case = snapshot.get("use_case")
+
+    row = {
         "symbol": symbol,
         "timeframe": timeframe,
         "use_case": use_case,
-        "structure_state": snapshot.get("structure_state", "unknown"),
-        "swings": snapshot.get("swings", {}),
-        "fvgs": snapshot.get("fvgs", []),
-        "liquidity": snapshot.get("liquidity", {}),
-        "volume_profile": snapshot.get("volume_profile", {}),
-        "trend": snapshot.get("trend", {}),
-        "extras": snapshot.get("extras", {}),
-        # let DB default now() if caller didn't set last_updated
-        "last_updated": snapshot.get("last_updated"),
+        "payload": _sanitize_value(snapshot),
     }
 
-    # Strip Nones so Supabase can use defaults
-    row = {k: v for k, v in row.items() if v is not None}
-
     try:
-        # 1) Fetch existing row (if any) so we can skip if nothing changed
-        resp = (
+        existing = (
             sb.table("spot_tf")
-            .select(
-                "structure_state,swings,fvgs,liquidity,volume_profile,trend,extras"
-            )
+            .select("symbol,timeframe,use_case,payload")
             .eq("symbol", symbol)
             .eq("timeframe", timeframe)
             .eq("use_case", use_case)
             .execute()
         )
-        existing_rows = getattr(resp, "data", None) or []
-        existing = existing_rows[0] if existing_rows else None
 
-        if existing:
-            keys = [
-                "structure_state",
-                "swings",
-                "fvgs",
-                "liquidity",
-                "volume_profile",
-                "trend",
-                "extras",
-            ]
-            unchanged = all(existing.get(k) == row.get(k) for k in keys)
-            if unchanged:
+        existing_rows = existing.data or []
+        if existing_rows:
+            current_payload = existing_rows[0].get("payload")
+            if current_payload == row["payload"]:
                 log(
                     "info",
-                    "spot_tf_upsert_skipped_no_change",
+                    "supabase_spot_tf_no_change",
                     symbol=symbol,
                     timeframe=timeframe,
                     use_case=use_case,
@@ -125,13 +96,7 @@ def upsert_spot_tf_row(symbol: str, snapshot: Dict[str, Any]) -> None:
 
         # 2) Actually upsert when there is a change or no existing row
         sb.table("spot_tf").upsert(row, on_conflict="symbol,timeframe,use_case").execute()
-        log(
-            "info",
-            "spot_tf_upsert_success",
-            symbol=symbol,
-            timeframe=timeframe,
-            use_case=use_case,
-        )
+
     except Exception as e:
         log(
             "error",
@@ -143,115 +108,59 @@ def upsert_spot_tf_row(symbol: str, snapshot: Dict[str, Any]) -> None:
         raise
 
 
-# ---------- Helpers for positions ----------
-
-def build_broker_position_id(broker: str, account_id: str, symbol: str) -> str:
+def build_position_id(symbol: str) -> str:
     """
-    Build a stable primary key for a broker position.
-
-    Example:
-      broker='alpaca', account_id='XYZ', symbol='SPY'
-      -> 'alpaca:XYZ:SPY'
+    Build a stable primary key for Alpaca-imported positions.
+    Example: alpaca:SPY250919C00450000
     """
-    sid = f"{broker}:{account_id}:{symbol.upper()}"
-    log(
-        "debug",
-        "supabase_build_position_id",
-        broker=broker,
-        account_id=account_id,
-        symbol=symbol,
-        id=sid,
-    )
-    return sid
-
-
-def build_tradier_id(account_id: str, symbol: str) -> str:
-    """
-    Backwards-compatible helper for old Tradier-based code.
-
-    New code should use build_broker_position_id(...) or a broker-specific helper.
-    """
-    return build_broker_position_id("tradier", account_id, symbol)
-
-
-def build_alpaca_id(account_id: str, symbol: str) -> str:
-    """
-    Convenience helper for Alpaca-based positions.
-    """
-    return build_broker_position_id("alpaca", account_id, symbol)
+    return f"alpaca:{symbol.upper()}"
 
 
 def upsert_position_row(row: Dict[str, Any]) -> str:
     """
-    Upsert a single row into public.positions.
+    Upsert a position row into public.positions.
+    Row MUST contain 'id' and any base fields (symbol, asset_type, occ, qty, avg_cost, etc.)
 
-    Expects row to already contain:
-      - id (broker:account:symbol or similar)
-      - symbol
-      - asset_type
-      - qty
-      - occ (for options, if any)
-      - avg_cost
-      - contract_multiplier
-      - prev_close / mark / underlier_spot (optional)
+    Uses Supabase 'upsert' on conflict id.
     """
     clean = _sanitize_row(row)
-    log("debug", "positions_upsert_start", row=clean)
     try:
         sb.table("positions").upsert(clean, on_conflict="id").execute()
-        log("info", "positions_upsert_success", id=clean.get("id"))
     except Exception as e:
-        log("error", "positions_upsert_error", row=clean, error=str(e))
+        log("error", "supabase_upsert_error", row=clean, error=str(e))
         raise
     return "upserted"
 
 
-def delete_missing_positions(broker: str, current_ids: List[str]) -> None:
+def delete_missing_positions(current_ids: List[str]) -> None:
     """
-    Delete positions in DB for a given broker that are no longer present
-    in the broker's latest position list.
-
-    current_ids should contain the full 'broker:account:symbol' ids
-    that are still alive.
+    Delete positions whose id starts with 'alpaca:' but are not in current_ids.
+    This prevents touching rows from other brokers.
     """
     current_set = set(current_ids)
-    log(
-        "debug",
-        "delete_missing_positions_start",
-        broker=broker,
-        current_count=len(current_ids),
-    )
 
-    res = sb.table("positions").select("id").like("id", f"{broker}:%").execute()
+    res = sb.table("positions").select("id").like("id", "alpaca:%").execute()
     rows = res.data or []
 
     for r in rows:
         pid = r["id"]
         if pid not in current_set:
             sb.table("positions").delete().eq("id", pid).execute()
-            log("info", "deleted_stale_position", broker=broker, id=pid)
+            log("info", "deleted_stale_position", id=pid)
 
 
-def delete_missing_tradier_positions(current_ids: List[str]) -> None:
+def fetch_spot_symbols_for_indicators(max_symbols: int = 500) -> List[str]:
     """
-    Backwards-compatible wrapper that deletes stale Tradier positions.
+    Return a list of symbols eligible for spot indicators, based on the 'spot' table.
 
-    New code should call delete_missing_positions('alpaca', current_ids)
-    or pass whichever broker is active.
+    'spot' is expected to expose:
+      - instrument_id as the raw symbol/underlier
+      - asset_type to filter out options
+
+    Only rows where asset_type looks like equity/stock/ETF/underlier
+    will be included. OCC-style option codes are also filtered out
+    using a length+digit heuristic for extra safety.
     """
-    delete_missing_positions("tradier", current_ids)
-
-
-def fetch_spot_symbols_for_indicators(max_symbols: int = 50) -> List[str]:
-    """
-    Fetch a list of underlying symbols from the spot table for which we
-    should compute indicators.
-
-    We only include equity/stock/ETF/underlier rows, and we try to ignore
-    OCC-style option symbols.
-    """
-    log("debug", "fetch_spot_symbols_for_indicators_start", max_symbols=max_symbols)
-
     try:
         resp = (
             sb.table("spot")
@@ -262,7 +171,7 @@ def fetch_spot_symbols_for_indicators(max_symbols: int = 50) -> List[str]:
             .execute()
         )
     except Exception as e:
-        log("error", "fetch_spot_symbols_for_indicators_error", error=str(e))
+        log("error", "supabase_fetch_spot_symbols_error", error=str(e))
         return []
 
     data = resp.data or []
@@ -276,7 +185,7 @@ def fetch_spot_symbols_for_indicators(max_symbols: int = 50) -> List[str]:
         if not raw_sym:
             continue
 
-        # Only treat these as underliers for indicators
+        # Only accept real underliers
         if asset_type not in ("equity", "stock", "etf", "underlier"):
             continue
 
@@ -284,7 +193,9 @@ def fetch_spot_symbols_for_indicators(max_symbols: int = 50) -> List[str]:
         if not sym:
             continue
 
-        # Filter out obvious OCC-style option symbols (long, contains digits)
+        # EXTRA SAFETY:
+        # Option OCC symbols are long and contain digits
+        # e.g., AMD240118C00100000
         if len(sym) > 6 and any(c.isdigit() for c in sym):
             continue
 
@@ -292,37 +203,22 @@ def fetch_spot_symbols_for_indicators(max_symbols: int = 50) -> List[str]:
             seen.add(sym)
             symbols.append(sym)
 
-    log("info", "fetch_spot_symbols_for_indicators_done", count=len(symbols))
     return symbols
 
 
-def fetch_active_positions(broker: str = "alpaca") -> List[Dict[str, Any]]:
+def fetch_active_positions() -> List[Dict[str, Any]]:
     """
-    Fetch active (qty != 0) positions for a given broker from public.positions.
+    Get all non-zero qty positions for Alpaca-imported rows (id like 'alpaca:%').
+    Also select generated 'underlier' for options so quotes loop can fetch underlier spot.
     """
-    log("debug", "fetch_active_positions_start", broker=broker)
-
     res = (
         sb.table("positions")
         .select("id,symbol,occ,asset_type,contract_multiplier,qty,avg_cost,underlier")
         .neq("qty", 0)
-        .like("id", f"{broker}:%")
+        .like("id", "alpaca:%")
         .execute()
     )
-
-    data = res.data or []
-    log("info", "fetch_active_positions_done", broker=broker, count=len(data))
-    return data
-
-
-def fetch_active_tradier_positions() -> List[Dict[str, Any]]:
-    """
-    Backwards-compatible wrapper for old Tradier-based code.
-
-    New code should call fetch_active_positions('alpaca') or pass
-    the desired broker explicitly.
-    """
-    return fetch_active_positions("tradier")
+    return res.data or []
 
 
 def update_quote_fields(pid: str, fields: Dict[str, Any]) -> None:
@@ -330,11 +226,8 @@ def update_quote_fields(pid: str, fields: Dict[str, Any]) -> None:
     Update mark / prev_close / underlier_spot / last_updated for a given position id.
     """
     clean = _sanitize_row(fields)
-    log("debug", "update_quote_fields_start", pid=pid, fields=clean)
     try:
         sb.table("positions").update(clean).eq("id", pid).execute()
-        log("info", "update_quote_fields_success", pid=pid)
     except Exception as e:
-        # This will dump the exact payload that could not be JSON-encoded
-        log("error", "supabase_update_error", id=pid, fields=clean, error=str(e))
+        log("error", "supabase_update_quote_fields_error", id=pid, fields=clean, error=str(e))
         raise
