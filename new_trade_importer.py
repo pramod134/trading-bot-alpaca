@@ -585,9 +585,15 @@ def _compute_option_strike_and_expiry(
     """
     symbol = (row.get("symbol") or "").upper()
 
+   
     # ----- STRIKE TARGET -----
     user_strike = _safe_float(row.get("strike"))
-    strike_pct = _safe_float(defaults.get("option_strike_pct")) or 0.05
+    
+    # otm_pct from defaults_config (fraction, e.g. 0.05 = 5% OTM)
+    strike_pct = _safe_float(defaults.get("otm_pct"))
+    if strike_pct is None:
+        strike_pct = 0.05  # fallback if config missing
+
 
     # Direction: C (call) / P (put)
     cp_letter = (cp_dir or "C").upper()
@@ -648,7 +654,7 @@ def _compute_option_strike_and_expiry(
             )
         except Exception:
             # If user expiry is malformed, fall back to default logic
-            weeks = int(defaults.get("expiry_weeks") or 3)
+            weeks = int(defaults.get("exp_weeks") or 3)
             target_days = weeks * 7
             log(
                 "warning",
@@ -660,7 +666,7 @@ def _compute_option_strike_and_expiry(
             )
             expiry_date = _snap_expiry_to_tradier(symbol, target_days)
     else:
-        weeks = int(defaults.get("expiry_weeks") or 3)
+        weeks = int(defaults.get("exp_weeks") or 3)
         target_days = weeks * 7
         log(
             "debug",
