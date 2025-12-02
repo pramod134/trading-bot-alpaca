@@ -843,21 +843,73 @@ def _compute_sl_tp_levels(
 
 
 def _decide_qty(row: Dict[str, Any], defaults: Dict[str, Any]) -> int:
+    """
+    Decide final qty with priority:
+      1) user-provided qty (if valid and > 0)
+      2) defaults_config.qty_default (if valid and > 0)
+      3) fallback = 1
+    """
     qty_row = row.get("qty")
+
+    # 1) User-provided qty
     if qty_row is not None:
         try:
             q = int(qty_row)
-            log("debug", "nt_import_qty_from_row", qty_row=qty_row, resolved=q)
-            return q
+            if q > 0:
+                log(
+                    "debug",
+                    "nt_import_qty_from_row",
+                    qty_row=qty_row,
+                    resolved=q,
+                )
+                return q
+            else:
+                log(
+                    "warning",
+                    "nt_import_qty_row_non_positive",
+                    qty_row=qty_row,
+                    resolved=q,
+                )
         except Exception:
-            log("warning", "nt_import_qty_row_parse_error", qty_row=qty_row)
+            log(
+                "warning",
+                "nt_import_qty_row_parse_error",
+                qty_row=qty_row,
+            )
+
+    # 2) defaults_config.qty_default
     try:
-        q_default = int(defaults.get("default_qty") or 0)
-        log("debug", "nt_import_qty_from_defaults", qty=q_default)
-        return q_default
+        qdef_raw = defaults.get("qty_default")
+        if qdef_raw is not None:
+            q_default = int(qdef_raw)
+            if q_default > 0:
+                log(
+                    "debug",
+                    "nt_import_qty_from_defaults",
+                    qty_default=q_default,
+                )
+                return q_default
+            else:
+                log(
+                    "warning",
+                    "nt_import_qty_default_non_positive",
+                    qty_default=q_default,
+                )
     except Exception:
-        log("error", "nt_import_qty_default_parse_error", default=defaults.get("default_qty"))
-        return 0
+        log(
+            "error",
+            "nt_import_qty_default_parse_error",
+            qty_default=defaults.get("qty_default"),
+        )
+
+    # 3) Fallback = 1
+    log(
+        "info",
+        "nt_import_qty_fallback",
+        fallback=1,
+    )
+    return 1
+
 
 
 # ---------- Row builders ----------
