@@ -527,12 +527,30 @@ def _compute_option_strike_and_expiry(
     expiry_text = (row.get("expiry") or "").strip()
     if expiry_text:
         try:
-            expiry_date = datetime.strptime(expiry_text, "%Y-%m-%d").date()
+            # User-provided expiry is treated as a *target* date.
+            # We convert it into "days from today" and let Tradier expirations
+            # snap it to the closest real listed expiry.
+            user_expiry = datetime.strptime(expiry_text, "%Y-%m-%d").date()
+            today = datetime.now(timezone.utc).date()
+            # Negative → clamp to 0 so we at least use the nearest future expiry.
+            target_days = max((user_expiry - today).days, 0)
+
             log(
                 "debug",
-                "nt_import_opt_user_expiry",
+                "nt_import_opt_user_expiry_target",
                 symbol=symbol,
-                expiry=expiry_date.isoformat(),
+                user_expiry=user_expiry.isoformat(),
+                target_days=target_days,
+            )
+
+            expiry_date = _snap_expiry_to_tradier(symbol, target_days)
+
+            log(
+                "info",
+                "nt_import_opt_user_expiry_snapped",
+                symbol=symbol,
+                user_expiry=user_expiry.isoformat(),
+                final_expiry=expiry_date.isoformat(),
             )
         except Exception:
             # If user expiry is malformed, fall back to default logic
