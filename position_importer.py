@@ -116,7 +116,7 @@ async def run_positions_loop() -> None:
                     log(
                         "info",
                         "alpaca_positions_empty",
-                        msg="No open positions from Alpaca; clearing broker-origin positions",
+                        detail="No open positions from Alpaca; clearing broker-origin positions",
                     )
                     # Passing an empty list means "there are no current broker
                     # positions", so delete_missing_positions should remove all
