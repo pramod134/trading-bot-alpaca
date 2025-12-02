@@ -183,48 +183,142 @@ async def _get_underlier_spot(
 
 # ---------- Defaults helpers ----------
 
-def _fetch_trade_defaults(asset_type: str, trade_type: str) -> Optional[Dict[str, Any]]:
+def _fetch_trade_defaults(
+    symbol: str, asset_type: str, trade_type: str
+) -> Optional[Dict[str, Any]]:
     """
-    Load a single row from trade_defaults for given asset_type + trade_type.
-    We expect you have global defaults (symbol IS NULL).
+    Load a single row from defaults_config for given symbol + asset_type + trade_type.
+
+    Priority:
+      1) symbol-specific row for (asset_type, trade_type)
+      2) global-symbol row for (asset_type, trade_type)
+      3) rows where trade_type is NULL (global per-asset)
+      4) fully-global row (scope='global', trade_type NULL, symbol NULL)
+
+    Notes:
+      - asset_type is matched via scope prefix: 'asset:{asset_type}:...'
+      - trade_type comes from the trade_type column.
     """
     sb = get_client()
+    sym_u = (symbol or "").upper()
+    at = (asset_type or "").lower()
+    tt = trade_type or None
+
     log(
         "debug",
         "nt_import_defaults_fetch_start",
+        symbol=symbol,
         asset_type=asset_type,
         trade_type=trade_type,
     )
+
     try:
-        resp = (
-            sb.table("trade_defaults")
-            .select("*")
-            .eq("asset_type", asset_type)
-            .eq("trade_type", trade_type)
-            .limit(1)
-            .execute()
-        )
+        # Small table, easiest is to pull all and score in Python.
+        resp = sb.table("defaults_config").select("*").execute()
         rows = getattr(resp, "data", None) or []
+
         log(
             "debug",
             "nt_import_defaults_fetch_result",
+            symbol=symbol,
             asset_type=asset_type,
             trade_type=trade_type,
             rows=len(rows),
         )
+
         if not rows:
             log(
                 "error",
-                "nt_import_no_defaults",
+                "nt_import_no_defaults_rows",
+                symbol=symbol,
                 asset_type=asset_type,
                 trade_type=trade_type,
             )
             return None
-        return rows[0]
+
+        best_row: Optional[Dict[str, Any]] = None
+        best_score = -1
+
+        for r in rows:
+            r_scope = (r.get("scope") or "").lower()
+            r_symbol_raw = r.get("symbol")
+            r_symbol = (r_symbol_raw or "").upper()
+            r_trade_type = r.get("trade_type")
+
+            # Derive asset_type from scope: 'asset:equity:scalp' → 'equity'
+            r_asset_type: Optional[str] = None
+            if r_scope.startswith("asset:"):
+                parts = r_scope.split(":")
+                if len(parts) >= 2:
+                    r_asset_type = parts[1]
+
+            # --- filter out obviously irrelevant rows ---
+            # Trade type: either exact match or global (NULL)
+            if r_trade_type not in (tt, None):
+                continue
+
+            # Asset type: either exact match or global ('global' scope / no asset)
+            if r_asset_type not in (at, None):
+                # allow 'global' scope even though r_asset_type is None
+                if r_scope != "global":
+                    continue
+
+            # --- scoring ---
+            score = 0
+
+            # Trade type specificity
+            if r_trade_type == tt:
+                score += 10
+            elif r_trade_type is None:
+                score += 5
+
+            # Asset type specificity
+            if r_asset_type == at:
+                score += 4
+            elif r_asset_type is None:
+                score += 2
+
+            # Symbol specificity
+            if sym_u and r_symbol == sym_u:
+                score += 3
+            elif not r_symbol:
+                score += 1
+
+            # Global row (scope='global') gets a tiny bump so we always have a fallback
+            if r_scope == "global":
+                score += 1
+
+            if score > best_score:
+                best_score = score
+                best_row = r
+
+        if not best_row:
+            log(
+                "error",
+                "nt_import_no_defaults_match",
+                symbol=symbol,
+                asset_type=asset_type,
+                trade_type=trade_type,
+            )
+            return None
+
+        log(
+            "info",
+            "nt_import_defaults_chosen",
+            symbol=symbol,
+            asset_type=asset_type,
+            trade_type=trade_type,
+            scope=best_row.get("scope"),
+            chosen_symbol=(best_row.get("symbol") or ""),
+        )
+
+        return best_row
+
     except Exception as e:
         log(
             "error",
             "nt_import_defaults_error",
+            symbol=symbol,
             asset_type=asset_type,
             trade_type=trade_type,
             error=str(e),
@@ -1065,7 +1159,7 @@ async def run_new_trades_import_loop() -> None:
                         )
 
                         # 1) Load defaults
-                        defaults = _fetch_trade_defaults(asset_type, trade_type)
+                        defaults = _fetch_trade_defaults(symbol, asset_type, trade_type)
                         if not defaults:
                             log(
                                 "error",
