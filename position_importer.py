@@ -109,8 +109,19 @@ async def run_positions_loop() -> None:
                     count=len(raw_positions),
                 )
 
-                # If nothing, skip
+                # If broker reports no open positions, immediately clear any
+                # broker-origin positions so we don't leave stale rows when
+                # positions are closed manually at the broker.
                 if not raw_positions:
+                    log(
+                        "info",
+                        "alpaca_positions_empty",
+                        msg="No open positions from Alpaca; clearing broker-origin positions",
+                    )
+                    # Passing an empty list means "there are no current broker
+                    # positions", so delete_missing_positions should remove all
+                    # positions tied to this broker.
+                    supabase_client.delete_missing_positions([])
                     await asyncio.sleep(interval)
                     continue
 
