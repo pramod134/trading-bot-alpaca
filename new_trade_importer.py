@@ -1027,15 +1027,25 @@ def _build_active_trade_row(
             sl_cond=sl_cond,
         )
 
+
     # Ensure sl_tf is never NULL when sl_level exists
     if sl_level is not None and not sl_tf:
-        sl_tf = entry_tf or defaults.get("entry_tf") or "5m"
+        sl_tf = (
+            entry_tf
+            or defaults.get("sl_tf")
+            or defaults.get("entry_tf")
+            or "5m"
+        )
         log(
             "debug",
             "nt_import_sl_tf_autofill",
             symbol=symbol,
-            sl_tf=sl_tf,
+            resolved_sl_tf=sl_tf,
+            entry_tf=entry_tf,
+            defaults_sl_tf=defaults.get("sl_tf"),
+            defaults_entry_tf=defaults.get("entry_tf"),
         )
+
 
     # For options, compute strike/expiry/occ if needed
     strike = None
