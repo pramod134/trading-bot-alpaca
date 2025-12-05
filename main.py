@@ -11,7 +11,7 @@ from new_trade_importer import run_new_trades_import_loop
 
 async def main() -> None:
     await asyncio.gather(
-        # run_positions_loop(),
+        #run_positions_loop(),
         run_quotes_loop(),
         run_new_trades_import_loop(),
     )
