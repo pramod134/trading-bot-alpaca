@@ -971,6 +971,12 @@ def _build_active_trade_row(
 
     tp_type = row.get("tp_type") or "equity"
     tp_level = _safe_float(row.get("tp_level"))
+    # Time window + tags (optional, passed through to active_trades)
+    entry_time = row.get("entry_time")
+    end_time = row.get("end_time")
+    tags = row.get("tags")
+
+    
 
     # Decide entry_cond / sl_cond based on rules
     conds = _decide_entry_and_sl_conds(
@@ -1106,6 +1112,9 @@ def _build_active_trade_row(
         "sl_tf": sl_tf,
         "tp_type": tp_type,
         "tp_level": tp_level,
+        "entry_time": entry_time,
+        "end_time": end_time,
+        "tags": tags,
         "manage": row.get("manage") or "Y",
         "last_close": None,
         "note": row.get("note"),
